@@ -146,6 +146,7 @@ import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
 import org.elasticsearch.xpack.esql.plan.logical.UnionAll;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedExternalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedRelation;
+import org.elasticsearch.xpack.esql.plan.logical.ViewShadowRelation;
 import org.elasticsearch.xpack.esql.plan.logical.fuse.Fuse;
 import org.elasticsearch.xpack.esql.plan.logical.fuse.FuseScoreEval;
 import org.elasticsearch.xpack.esql.plan.logical.inference.Completion;
@@ -167,11 +168,11 @@ import org.elasticsearch.xpack.esql.rule.Rule;
 import org.elasticsearch.xpack.esql.session.Configuration;
 import org.elasticsearch.xpack.esql.telemetry.FeatureMetric;
 import org.elasticsearch.xpack.esql.type.EsqlDataTypeConverter;
+import org.elasticsearch.xpack.esql.view.ViewCompaction;
 
 import java.time.Duration;
 import java.time.temporal.TemporalAmount;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
@@ -234,6 +235,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             Limiter.ONCE,
             new ResolveConfigurationAware(),
             new ResolveTable(),
+            new ResolveViewShadow(),
+            new ViewCompactionPostIndexResolution(),
             new ResolveExternalRelations(),
             new PruneEmptyUnionAllBranch(),
             new ResolveEnrich(),
@@ -484,6 +487,66 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                     mappingAsAttributes(list, source, attribute.name(), fieldProperties);
                 }
             }
+        }
+    }
+
+    /**
+     * Resolves {@link ViewShadowRelation} nodes against {@link AnalyzerContext#optionalLinkedResolution()}.
+     * <p>
+     * Each {@code ViewShadowRelation} represents a "if a remote project has an index with this
+     * view's name, treat it as if the user wrote a remote index reference at this position"
+     * lookup. The lenient field-caps integration (deferred to a follow-up PR) populates
+     * {@code optionalLinkedResolution}, keyed by the shadow's {@link ViewShadowRelation#optionalLinkedPattern()}
+     * (view name + applicable exclusions). The full pattern is the lookup key — different
+     * exclusion lists at the same view name produce distinct {@code ViewShadowRelation}
+     * instances and may resolve differently (e.g. one comes back empty because of the
+     * exclusions, the other resolves to a remote index). This rule:
+     * <ul>
+     *   <li>If a valid {@link IndexResolution} is present for the shadow's
+     *       {@link ViewShadowRelation#optionalLinkedPattern()}, replaces the shadow with an
+     *       {@link EsRelation} built from the resolved {@link EsIndex} (same shape as
+     *       {@link ResolveTable}'s {@code resolveIndex} for a strict UR).</li>
+     *   <li>Otherwise leaves the shadow unresolved. {@link ViewCompactionPostIndexResolution}
+     *       (which runs immediately after this rule) strips any unresolved shadow.</li>
+     * </ul>
+     */
+    private static class ResolveViewShadow extends ParameterizedAnalyzerRule<ViewShadowRelation, AnalyzerContext> {
+
+        @Override
+        protected LogicalPlan rule(ViewShadowRelation shadow, AnalyzerContext context) {
+            IndexResolution resolution = context.optionalLinkedResolution().get(shadow.optionalLinkedPattern());
+            if (resolution == null || resolution.isValid() == false) {
+                // No remote index found (or lookup didn't run yet) — leave the shadow alone for
+                // ViewCompactionPostIndexResolution to strip.
+                return shadow;
+            }
+            EsIndex esIndex = resolution.get();
+            var attributes = mappingAsAttributes(shadow.source(), esIndex.mapping());
+            return new EsRelation(
+                shadow.source(),
+                esIndex.name(),
+                IndexMode.STANDARD,
+                esIndex.originalIndices(),
+                esIndex.concreteIndices(),
+                esIndex.indexNameWithModes(),
+                attributes.isEmpty() ? NO_FIELDS : attributes
+            );
+        }
+    }
+
+    /**
+     * Phase 2 of view compaction. Runs in the Initialize batch right after {@link ResolveTable},
+     * once all reachable {@link UnresolvedRelation}s have been replaced with {@code EsRelation}s
+     * (and once CPS's lenient field-caps rule has rewritten any matched {@code ViewShadowRelation}s).
+     * Strips remaining unresolved shadows, flattens nested {@code ViewUnionAll} structures, and
+     * unwraps remaining {@code NamedSubquery} wrappers. See {@link ViewCompaction} for the rationale
+     * behind splitting compaction across the analyzer boundary.
+     */
+    private static class ViewCompactionPostIndexResolution extends Rule<LogicalPlan, LogicalPlan> {
+
+        @Override
+        public LogicalPlan apply(LogicalPlan plan) {
+            return ViewCompaction.postIndexResolution(plan);
         }
     }
 
@@ -1665,14 +1728,14 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 boolean deferToUnionTypes = resolved instanceof FieldAttribute fa && fa.hasTypeConflicts();
                 if (deferToUnionTypes == false && resolved.resolved() && resolved.dataType() != NULL && enrich.policy() != null) {
                     String matchType = enrich.policy().getType();
-                    DataType[] allowed = allowedEnrichTypes(matchType);
-                    if (Arrays.asList(allowed).contains(resolved.dataType()) == false) {
+                    List<DataType> allowed = allowedEnrichTypes(matchType);
+                    if (allowed.contains(resolved.dataType()) == false) {
                         resolved = ua.withUnresolvedMessage(
                             Strings.format(
                                 "Unsupported type [%s] for enrich matching field [%s]; only [%s] allowed for type [%s]",
                                 resolved.dataType().typeName(),
                                 ua.name(),
-                                Arrays.stream(allowed).map(DataType::typeName).collect(Collectors.joining(", ")),
+                                allowed.stream().map(DataType::typeName).collect(Collectors.joining(", ")),
                                 matchType
                             )
                         );
@@ -1711,10 +1774,10 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             return resolved;
         }
 
-        private static final DataType[] GEO_TYPES = new DataType[] { GEO_POINT, GEO_SHAPE };
-        private static final DataType[] NON_GEO_TYPES = new DataType[] { KEYWORD, TEXT, IP, LONG, INTEGER, FLOAT, DOUBLE, DATETIME };
+        private static final List<DataType> GEO_TYPES = List.of(GEO_POINT, GEO_SHAPE);
+        private static final List<DataType> NON_GEO_TYPES = List.of(KEYWORD, TEXT, IP, LONG, INTEGER, FLOAT, DOUBLE, DATETIME);
 
-        private DataType[] allowedEnrichTypes(String matchType) {
+        private List<DataType> allowedEnrichTypes(String matchType) {
             return matchType.equals(GEO_MATCH_TYPE) ? GEO_TYPES : NON_GEO_TYPES;
         }
     }
@@ -3486,23 +3549,22 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
 
         @Override
         protected LogicalPlan rule(UnionAll unionAll, AnalyzerContext context) {
+            // Delegate to UnionAll#pruneEmptyBranches — ViewUnionAll overrides it to preserve
+            // its named-subqueries map so this rule works correctly when an EMPTY_SUBQUERY
+            // branch lives next to a CPS shadow inside a ViewUnionAll.
             Map<IndexPattern, IndexResolution> indexResolutions = context.indexResolution();
-            // check if any child is an UnresolvedRelation that resolves to an empty subquery
-            List<LogicalPlan> newChildren = new ArrayList<>(unionAll.children().size());
-            for (LogicalPlan child : unionAll.children()) {
-                // check for UnresolvedRelation in the child plan tree
-                Holder<Boolean> isEmptySubquery = new Holder<>(Boolean.FALSE);
-                child.forEachUp(UnresolvedRelation.class, ur -> {
-                    IndexResolution resolution = indexResolutions.get(ur.indexPattern());
-                    if (resolution == IndexResolution.EMPTY_SUBQUERY) {
-                        isEmptySubquery.set(Boolean.TRUE);
-                    }
-                });
-                if (isEmptySubquery.get() == false) {
-                    newChildren.add(child);
+            return unionAll.pruneEmptyBranches(child -> resolvesToEmptySubquery(child, indexResolutions));
+        }
+
+        private static boolean resolvesToEmptySubquery(LogicalPlan branch, Map<IndexPattern, IndexResolution> indexResolutions) {
+            Holder<Boolean> isEmpty = new Holder<>(Boolean.FALSE);
+            branch.forEachUp(UnresolvedRelation.class, ur -> {
+                IndexResolution resolution = indexResolutions.get(ur.indexPattern());
+                if (resolution == IndexResolution.EMPTY_SUBQUERY) {
+                    isEmpty.set(Boolean.TRUE);
                 }
-            }
-            return newChildren.size() == unionAll.children().size() ? unionAll : unionAll.replaceChildren(newChildren);
+            });
+            return isEmpty.get();
         }
     }
 }
