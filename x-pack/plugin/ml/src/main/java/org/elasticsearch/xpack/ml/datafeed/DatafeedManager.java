@@ -549,18 +549,11 @@ public final class DatafeedManager {
      * This prevents key leaks when operations (validation, persistence, etc.) fail after key creation.
      * The original failure is always propagated to the delegate listener regardless of revocation outcome.
      */
-    private <T> ActionListener<T> revokeKeyOnFailure(
-        PersistedCloudCredential mintedCredential,
-        String jobId,
-        ActionListener<T> delegate
-    ) {
+    private <T> ActionListener<T> revokeKeyOnFailure(PersistedCloudCredential mintedCredential, String jobId, ActionListener<T> delegate) {
         return ActionListener.wrap(delegate::onResponse, e -> {
             // TODO: invoke InternalCloudApiKeyService.revokeCloudApiKey once the revoke primitive is available
             // (tracked in beads issue elastic-workspace-rqpf)
-            auditor.info(
-                jobId,
-                Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_SKIPPED, mintedCredential.id())
-            );
+            auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_SKIPPED, mintedCredential.id()));
             mintedCredential.close();
             delegate.onFailure(e);
         });

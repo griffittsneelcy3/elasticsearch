@@ -28,7 +28,6 @@ import org.elasticsearch.xpack.core.ml.datafeed.DatafeedConfig;
 import org.elasticsearch.xpack.core.ml.datafeed.DatafeedUpdate;
 import org.elasticsearch.xpack.core.ml.job.messages.Messages;
 import org.elasticsearch.xpack.core.rollup.action.GetRollupIndexCapsAction;
-import org.elasticsearch.xpack.core.security.cloud.CloudCredentialsExtension;
 import org.elasticsearch.xpack.core.security.SecurityContext;
 import org.elasticsearch.xpack.core.security.action.user.HasPrivilegesAction;
 import org.elasticsearch.xpack.core.security.action.user.HasPrivilegesResponse;
@@ -37,6 +36,7 @@ import org.elasticsearch.xpack.core.security.authc.AuthenticationTestHelper;
 import org.elasticsearch.xpack.core.security.authc.support.SecondaryAuthentication;
 import org.elasticsearch.xpack.core.security.cloud.CloudCredential;
 import org.elasticsearch.xpack.core.security.cloud.CloudCredentialManager;
+import org.elasticsearch.xpack.core.security.cloud.CloudCredentialsExtension;
 import org.elasticsearch.xpack.core.security.cloud.InternalCloudApiKeyService;
 import org.elasticsearch.xpack.core.security.cloud.PersistedCloudCredential;
 import org.elasticsearch.xpack.core.security.user.User;
@@ -796,10 +796,7 @@ public class DatafeedManagerTests extends ESTestCase {
         );
 
         verify(auditor).info(eq("test-job"), eq(Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REKEYED)));
-        verify(auditor).info(
-            eq("test-job"),
-            eq(Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_SKIPPED, "old-key-id"))
-        );
+        verify(auditor).info(eq("test-job"), eq(Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_SKIPPED, "old-key-id")));
         assertThat(response.get(), notNullValue());
         assertThat(response.get().getResponse().getCloudInternalCredential(), equalTo(newCred));
         verify(datafeedConfigProvider).updateDatefeedConfig(
